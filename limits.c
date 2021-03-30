@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <libgen.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -8,250 +9,387 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/user.h>
+#include <regex.h>
+#include <glib.h>
 #include <err.h>
 
-extern char **environ;
+#include "proc.h"
+#include "flags.h"
+#include "rlim.h"
 
-static const char * limit_to_str(uint8_t limit)
+static void print_usage(const char *name)
 {
-    static char * limits[UINT8_MAX] = {
-        [RLIMIT_CPU]        "RLIMIT_CPU",
-        [RLIMIT_FSIZE]      "RLIMIT_FSIZE",
-        [RLIMIT_DATA]       "RLIMIT_DATA",
-        [RLIMIT_STACK]      "RLIMIT_STACK",
-        [RLIMIT_CORE]       "RLIMIT_CORE",
-        [RLIMIT_RSS]        "RLIMIT_RSS",
-        [RLIMIT_NOFILE]     "RLIMIT_NOFILE",
-        [RLIMIT_AS]         "RLIMIT_AS",
-        [RLIMIT_NPROC]      "RLIMIT_NPROC",
-        [RLIMIT_MEMLOCK]    "RLIMIT_MEMLOCK",
-        [RLIMIT_LOCKS]      "RLIMIT_LOCKS",
-        [RLIMIT_SIGPENDING] "RLIMIT_SIGPENDING",
-        [RLIMIT_NICE]       "RLIMIT_NICE",
-        [RLIMIT_RTPRIO]     "RLIMIT_RTPRIO",
-        [RLIMIT_NLIMITS]    "RLIMIT_NLIMITS",
-    };
+    const char *description =
+        "Test how COMMAND reacts to reduced resource limits.\n\n"
+        "\t-t TIMEOUT   Kill the process if it takes longer than this.\n"
+        "\t-b FILTER    Load regex (one per line) to filter output.\n"
+        "\t-o OUTPUT    Generate commands to see output in file.\n"
+        "\t-i INFILE    Attach specified file to process stdin.\n"
+        "\n"
+        "Example:\n\n"
+        "\tlimits -b filters.txt -o output -- /usr/bin/sudo";
 
-    return limits[limit] ? limits[limit] : "RLIMIT_UNKNOWN";
+    printf("%s [OPTIONS] [--] COMMAND [ARGS..]\n", name);
+    puts(description);
+    return;
 }
 
-// This is used to check if we recognise this error message from the rtld
-// subprocess.
-static uint32_t checksum(uint8_t *p, size_t len)
+// This routine reads a list of regex that should be removed from
+// the output of programs being tested.
+//
+// The reason this is necessary is that some programs will add timestamps or
+// pids to error messages and we have no way of knowing if this is a new error
+// message, or an old one with a new timestamp.
+//
+// The list should be freed when no longer needed.
+static GSList * parse_filterlist_file(const char *filename)
 {
-        uint32_t i;
-        uint32_t crc = 0;
+    GSList *list;
+    gchar *file;
+    gchar **patterns;
 
-        for (crc = 0; len; len--) {
-            crc ^= *p++;
-            for (i = 0; i < 8; i++) {
-                crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
-            }
+    // Read in the list of regex.
+    if (g_file_get_contents(filename, &file, NULL, NULL) != true) {
+        err(EXIT_FAILURE, "failed to open filter pattern file %s", filename);
+        return NULL;
+    }
+
+    // Split that, one per line.
+    patterns = g_strsplit(file, "\n", -1);
+
+    // We return a linked list of compiled regex.
+    list = NULL;
+
+    // Attempt to compile each patten.
+    for (guint i = 0; i < g_strv_length(patterns); i++) {
+        GRegex *r;
+
+        g_debug("attempting to parse pattern /%s/", patterns[i]);
+
+        // Check if this is a comment.
+        if (patterns[i][0] == '#' || patterns[i][0] == '\0') {
+            continue;
         }
 
-        return crc;
-}
+        // Not a comment, compile the regex.
+        r = g_regex_new(patterns[i], G_REGEX_OPTIMIZE, 0, NULL);
 
-static uint32_t set_all_limits(struct rlimit rlim[RLIMIT_NLIMITS])
-{
-    uint32_t i;
-
-    for (i = 0; i < RLIMIT_NLIMITS; i++) {
-        if (setrlimit(i, &rlim[i]) != 0) {
-            warn("failed to setrlimit for %u", i);
+        if (r == NULL) {
+            errx(EXIT_FAILURE, "failed to compile expression %s", patterns[i]);
+            continue;
         }
+
+        // It compiled, append to the filter list.
+        list = g_slist_append(list, r);
     }
 
-    return 0;
+    g_print("file %s contained %d valid filter patterns.\n",
+            filename,
+            g_slist_length(list));
+
+cleanup:
+    // cleanup.
+    g_strfreev(patterns);
+    g_free(file);
+    return list;
 }
 
-static uint32_t get_all_limits(struct rlimit rlim[RLIMIT_NLIMITS])
+// Combine the results of an execution into a string.
+// Note: checksum is freed.
+static gchar *create_output_key(int result, siginfo_t *info, gchar *checksum)
 {
-    uint32_t i;
+    gchar *hash = g_strdup_printf("%08X%08X%08X%s",
+                                  result,
+                                  info->si_status,
+                                  info->si_code,
+                                  checksum);
+    g_free(checksum);
+    return hash;
+}
 
-    for (i = 0; i < RLIMIT_NLIMITS; i++) {
-        if (getrlimit(i, &rlim[i]) != 0) {
-            warn("failed to getrlimit for %u", i);
+static void check_used_envvars(gchar **argv, gint timeout, GSList *filters)
+{
+    char **envp = g_get_environ();
+    gchar *origsum;
+    gchar *testsum;
+    guint found;
+    gint result;
+    siginfo_t siginfo;
+
+    g_print("testing what environment variables influence output...\n");
+
+    // Record the default output.
+    result = read_output_subprocess(argv,
+                                    envp,
+                                    NULL,
+                                    &siginfo,
+                                    &origsum,
+                                    timeout,
+                                    filters);
+
+    // Calculate checksum.
+    origsum = create_output_key(result, &siginfo, origsum);
+
+    // Scan to see which variables make a difference.
+    for (gint i = found = 0; i < g_strv_length(envp); i++) {
+        gchar *saved = envp[i];
+
+        envp[i]      = envp[0];
+        envp[0]      = saved;
+
+        g_debug("testing %s", saved);
+
+        result = read_output_subprocess(argv,
+                                        &envp[1],
+                                        NULL,
+                                        &siginfo,
+                                        &testsum,
+                                        timeout,
+                                        filters);
+
+        testsum = create_output_key(result, &siginfo, testsum);
+
+        if (g_strcmp0(testsum, origsum) != 0) {
+            gint len = strcspn(saved, "=");
+            g_print("\t$%.*s\n", len, saved);
+            found++;
         }
+
+        g_free(testsum);
     }
 
-    return 0;
+    g_print("found %u variable(s) that change output\n", found);
+    g_strfreev(envp);
+    g_free(origsum);
+    return;
 }
 
-static uint32_t spawn_process(char **argv, struct rlimit rlim[RLIMIT_NLIMITS], char *output, size_t outputmax)
-{
-    int         pipefd[2];
-    int         status;
-    pid_t       child;
-    ssize_t     readlen   = 0;
-    size_t      totalread = 0;
-    char       *newenv[] = {
-        "TERM=test",
-        NULL,
-    };
-
-    if (pipe(pipefd) != 0) {
-        errx(1, "creating pipe for subprocess returned failure");
-    }
-
-    switch (child = fork()) {
-        case 0:
-            if (close(pipefd[0]) != 0) {
-                errx(1, "unable to close read descriptor from pipe array");
-            }
-
-            if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
-                errx(1, "failed to map stdout to pipe");
-            }
-
-            if (dup2(pipefd[1], STDERR_FILENO) == -1) {
-                errx(1, "failed to map stderr to pipe");
-            }
-
-            set_all_limits(rlim);
-
-            alarm(5);
-
-            if (execve(*argv, argv, environ) == -1) {
-                errx(1, "execve failed to launch requested binary");
-            }
-
-            // Not reached.
-            errx(1, "execle returned unexpectedly");
-        case -1:
-            errx(1, "unable to create child process");
-        default:
-            if (close(pipefd[1]) != 0) {
-                errx(1, "unable to close write descriptor from pipe array");
-            }
-    }
-
-    // Initialize.
-    memset(output, 0, outputmax);
-
-    // Read all available output from child.
-    do {
-        readlen     = read(pipefd[0], output + totalread, outputmax - totalread);
-        totalread   = totalread + readlen;
-    } while (readlen > 0);
-
-    if (readlen == -1) {
-        errx(1, "there was an error reading child output from the pipe");
-    }
-
-    // Wait for the child to finish.
-    if (waitpid(child, &status, 0) != child) {
-        errx(1, "waitpid did not give us the process status we expected");
-    }
-
-    // Close the rest of the pipe.
-    if (close(pipefd[0]) != 0) {
-        errx(1, "unable to close read descriptor from pipe array");
-    }
-
-    if (WIFEXITED(status)) {
-        totalread += snprintf(output + totalread,
-                              outputmax - totalread,
-                              "EXIT %d\n",
-                              WEXITSTATUS(status),
-                              checksum(output, totalread));
-    } else if (WIFSIGNALED(status)) {
-        totalread += snprintf(output + totalread,
-                              outputmax - totalread,
-                              "SIG %d\n",
-                              WTERMSIG(status));
-    } else {
-        errx(1, "child process stopped for unexpected reason");
-    }
-
-    if (strstr(output, "MEMORY-ERROR")) {
-        strcpy(output, "MEMORY-ERROR");
-        totalread = strlen(output);
-    }
-
-    if (strstr(output, "(process:")) {
-        memset(strstr(output, "(process:"), ' ', strchr(output, ')') - strstr(output, "(process:"));
-    }
-
-    return checksum(output, totalread);
-}
-
-bool check_known_output(uint32_t checksum)
-{
-    static uint32_t num_outputs;
-    static uint32_t known_output[1024];
-    int i;
-
-    for (i = 0; i < num_outputs; i++) {
-        if (known_output[i] == checksum)
-            return true;
-    }
-
-    fprintf(stdout, "learnt new output checksum %#x\n", checksum);
-
-    known_output[num_outputs++] = checksum;
-
-    return false;
-}
+static GHashTable *outputmap;
+static gint timeout = 1;
+static char **envp;
+static char *stdinfile = "/dev/null";
 
 int main(int argc, char **argv)
 {
     struct rlimit limits[RLIMIT_NLIMITS];
-    char output[32768];
-    int limit;
-    int normal;
-    int i;
+    GSList *filters = NULL;
+    gchar *command = NULL;
+    FILE *logfile = NULL;
+    int opt;
 
-    for (limit = 0; limit < RLIMIT_NLIMITS; limit++) {
-        // Blacklist NPROC because it's difficult to handle generically.
-        if (limit == RLIMIT_NPROC) {
+    while ((opt = getopt(argc, argv, "i:t:ho:b:")) != -1) {
+        switch (opt) {
+            case 'h':
+                print_usage(*argv);
+                return 0;
+            case 'b':
+                filters = parse_filterlist_file(optarg);
+                break;
+            case 'o':
+                logfile = fopen(optarg, "w");
+                fprintf(logfile, "#!/bin/sh\n");
+                fflush(logfile);
+                break;
+            case 't':
+                timeout = g_ascii_strtoull(optarg, NULL, 0);
+                break;
+            case 'i':
+                stdinfile = optarg;
+                break;
+            default:
+                print_usage(*argv);
+                return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        errx(EXIT_FAILURE, "expected a command to test");
+    }
+
+    // Attach stdin to child processes.
+    setup_proc_stdin(stdinfile);
+
+    // Create a hashtable to store the known outputs.
+    outputmap = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+
+    // Create a copy of the command for logfiles.
+    command = g_strjoinv(" ", &argv[optind]);
+
+    envp = g_get_environ();
+
+    // Make any necessary changes to the childs environment.
+    envp = g_environ_setenv(envp, "MALLOC_CHECK_", "2", false);
+
+    check_used_envvars(&argv[optind], timeout, filters);
+
+    // For each of the possible resource limits, we try to see if
+    // it makes the program behave differently.
+    //
+    // If it does, we examine it more closely.
+    for (gint limit = 0; limit < RLIMIT_NLIMITS; limit++) {
+        gint result;
+        gint distance;
+        gchar *origsum;
+        gchar *testsum;
+        siginfo_t siginfo;
+
+        g_debug("testing limit %d w/granularity %d",
+                limit,
+                get_limit_granularity(limit));
+
+        // Skip any ignored limits.
+        if (get_limit_granularity(limit) == 0) {
             continue;
         }
 
-        fprintf(stderr, "searching %s...\n", limit_to_str(limit));
+        g_print("searching %s...\n", limit_to_str(limit));
 
-        // Fetch our default limits.
-        get_all_limits(limits);
+        // Initialize limits from our limits.
+        init_limits_array(limits);
 
         // Record the default output.
-        normal = spawn_process(&argv[1], limits, output, sizeof output);
+        result = read_output_subprocess(&argv[optind],
+                                        envp,
+                                        limits,
+                                        &siginfo,
+                                        &origsum,
+                                        timeout,
+                                        filters);
 
-        // Now find a reasonable start point to reduce to.
+        origsum = create_output_key(result, &siginfo, origsum);
+
+        g_debug("default output key is %s", origsum);
+
+        // Now find a reasonable start point by bisecting it until something
+        // changes.
         while (limits[limit].rlim_cur >>= 1) {
-            if (spawn_process(&argv[1], limits, output, sizeof output) != normal) {
+            g_print("\t@%#020lx...", limits[limit].rlim_cur);
+
+            result = read_output_subprocess(&argv[optind],
+                                            envp,
+                                            limits,
+                                            &siginfo,
+                                            &testsum,
+                                            timeout,
+                                            filters);
+
+            testsum = create_output_key(result, &siginfo, testsum);
+
+            // Check if this has changed.
+            if (g_strcmp0(testsum, origsum) != 0) {
+                // Put it back the way it was.
                 limits[limit].rlim_cur <<= 1;
-                fprintf(stderr, "starting search@%#x...\n", limits[limit].rlim_cur);
+
+                // Put it one above to make sure we collect all errors.
+                limits[limit].rlim_cur++;
+
+                // Report that we found a new error.
+                g_print("different\n");
+                g_free(testsum);
+                break;
+            }
+
+            g_free(testsum);
+            g_print("same\r");
+        }
+
+        // Now we know where to start searching, so we can start reducing it by
+        // the appropriate granularity. This is needed because for some limits
+        // it's pointless testing every possible value, because only the
+        // nearest page is actualy enforced.
+
+        // Seed the normal output in the hashtable.
+        g_hash_table_add(outputmap, origsum);
+
+search:
+        // Attempt to reduce the limit until we get a different result.
+        for (distance = 0;
+             limits[limit].rlim_cur >= get_limit_granularity(limit);
+             limits[limit].rlim_cur -= get_limit_granularity(limit)) {
+            gchar *checksum;
+
+            // Sometimes things go really slowly, so increase granularity if
+            // that's the case.
+            limits[limit].rlim_cur -= MIN(get_limit_granularity(limit)
+                                             * (distance / 32),
+                                          limits[limit].rlim_cur);
+
+            g_print("Testing %s = %#020lx...",
+                    limit_to_str(limit),
+                    limits[limit].rlim_cur);
+
+            result = read_output_subprocess(&argv[optind],
+                                            envp,
+                                            limits,
+                                            &siginfo,
+                                            &checksum,
+                                            timeout,
+                                            filters);
+
+            checksum = create_output_key(result, &siginfo, checksum);
+
+            // Check if this key is known. Note that we don't need to free
+            // checksum, the GDestroyNotify function in the GHashTable will
+            // handle it.
+            if (g_hash_table_add(outputmap, checksum)) {
+
+                g_debug("checksum %s was not previously known", checksum);
+                g_print("new\n");
+
+                // If we have a logfile, try to make it a valid shellscript.
+                if (logfile) {
+                    fprintf(logfile, "%s/runlimit %s %#lx %s < %s\n",
+                                     dirname(*argv),
+                                     limit_to_str(limit),
+                                     limits[limit].rlim_cur,
+                                     command,
+                                     stdinfile);
+                    fflush(logfile);
+                }
+
+                // Reset how long it's been since we've seen a change.
+                distance = 0;
+
+                // If there are too many outputs, program might be printing
+                // timestamps or something.
+                if (g_hash_table_size(outputmap) == 128) {
+                    warnx("There seems to be many different outputs.");
+                    warnx("This is usually a sign you need to use filters.");
+                }
+            } else {
+                g_print("\r");
+            }
+
+            // No need to continue.
+            if (limits[limit].rlim_cur < get_limit_granularity(limit)) {
                 break;
             }
         }
 
-        while (limits[limit].rlim_cur > 0x1000) {
-            limits[limit].rlim_cur -= 0x1000;
-
-            if (spawn_process(&argv[1], limits, output, sizeof output) != normal) {
-                normal = spawn_process(&argv[1], limits, output, sizeof output);
-
-                limits[limit].rlim_cur += 0x1000;
-                // Now reduce this limit until it reaches zero, and record each new
-                // output.
-                for (i = 0; i < 0x1000; i++) {
-                    limits[limit].rlim_cur--;
-
-                    if (check_known_output(spawn_process(&argv[1], limits, output, sizeof output)) == false) {
-                        fprintf(stderr, "found new error message @limit %s->%#lx\n\t%s\n", limit_to_str(limit), limits[limit].rlim_cur, output);
-                    }
-                }
-            }
-        }
-
-        // Now reduce this limit until it reaches zero, and record each new
-        // output.
-        while (limits[limit].rlim_cur--) {
-            if (check_known_output(spawn_process(&argv[1], limits, output, sizeof output)) == false) {
-                fprintf(stderr, "found new error message @limit %s->%#lx\n\t%s\n", limit_to_str(limit), limits[limit].rlim_cur, output);
-            }
-        }
+        // Make sure we don't finish on a \r
+        g_print("\n");
     }
+
+    if (!logfile && g_hash_table_size(outputmap)) {
+        g_print("Hint: use -o output.sh to generate a test script\n");
+    }
+
+cleanup:
+
+    g_hash_table_destroy(outputmap);
+
+    if (logfile)
+        fclose(logfile);
+
+    if (filters)
+        g_slist_free_full(filters, (GDestroyNotify) g_regex_unref);
+
+    if (command)
+        g_free(command);
+
+    if (envp)
+        g_strfreev(envp);
 
     return 0;
 }

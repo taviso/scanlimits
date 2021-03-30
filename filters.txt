@@ -1,0 +1,18 @@
+# This is a log timestamp, used by some glib programs.
+\d+:\d+:\d+\.\d+:
+
+# Hide process name idents, like (foo:1234): error
+\([^:]+:\d+\):
+
+# Another common format for idents, foo[1234]: error
+\[\d+\]:
+
+# Not so common, but some programs just print the pid at the start.
+\d+: [a-z]+: 
+
+# Common debug output
+[TPtp][iI][dD].* is \d+
+
+# Timing data, e.g. ping
+\d+\.\d+/\d+\.\d+/\d+\.\d+/\d+\.\d+ ms
+time=\d+\.\d+ ms
