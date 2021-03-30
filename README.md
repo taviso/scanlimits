@@ -3,20 +3,30 @@
 > A tool to examine the behaviour of setuid binaries when constrained.
 
 If you set resource limits using `setrlimit()`, `prlimit()` or the `ulimit`
-shell builtin, then those limits apply even across a setuid `execve()`. To put
-it another way, any limits you apply to your current shell also apply to
-any privileged executables you run.
+shell builtin, then those limits apply even across a setuid `execve()`.
 
-This might be surprising if you didn't know already know it, but it makes sense
-when you think about setuid only altering your *effective* uid, not your *real*
-uid. After all, It wouldn't make much sense if you could just sidestep forkbomb
-restrictions by creating a bunch of `/bin/su` processes.
+To put it another way, any limits you apply to your current shell also apply to
+any setuid executables you run. Some developers find this surprising, and it
+can introduce vulnerabilities.
 
-This introduces some interesting attack surface, how do privileged programs
-react when an untrusted user can truncate writes, limit number of files, or
-make arbitrary allocations fail?
+Here is an example, the `pam_nologin(8)` module is used to prevent
+login if the file `/etc/nologin` exists, so that the system administrator can
+temporarily disable login. The code just looks like this:
 
-The answer is that many do not handle it gracefully `¯\_(ツ)_/¯`
+```c
+	fd = open(nologin, O_RDONLY, 0);
+	if (fd < 0) {
+		login_close(lc);
+		return (PAM_SUCCESS);
+	}
+```
+
+It doesn't check `errno` though, and an unprivileged user can make this return
+failure (`EMFILE`, Too many open files) by setting a very low `RLIMIT_NOFILE`
+limit.
+
+Therefore, this check can be bypassed if it's required for `su` or similar
+authentication.
 
 # Building
 
@@ -113,11 +123,12 @@ user: root`, these are worth exploring to see if they might fail open anywhere.
 
 ## Options
 
-|| Option           | Description
-| `-t TIMEOU`       | Kill the process if it takes longer than this (seconds).
-| `-b FILTER`       | Load regex (one per line) to clean output.
-| `-o OUTPUT`       | Generate a script to see the different outputs found.
-| `-i INFILE`       | Attach this file to stdin of processes.
+| Option            | Description                                              |
+| ----------------- | -------------------------------------------------------- |
+| `-t TIMEOUT`      | Kill the process if it takes longer than this (seconds). |
+| `-b FILTER`       | Load regex (one per line) to clean output.               |
+| `-o OUTPUT`       | Generate a script to see the different outputs found.    |
+| `-i INFILE`       | Attach this file to stdin of processes.                  |
 
 ### Filters
 
@@ -164,5 +175,5 @@ source users.deny
 ```
 
 That won't work, because a user can limit the number of files that can be
-opened, making the attempt to open the `users.deny` file return `ENFILE`.
+opened, making the attempt to open the `users.deny` file return `EMFILE`.
 
