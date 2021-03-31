@@ -164,7 +164,7 @@ can really happen, e.g. CVE-2019-14865
 
 
 Another example might be programs that parse configuration files, for example
-imagine a program that has a configuraion file like this:
+imagine a program that has a configuration file like this:
 
 ```
 # All users in group staff are allowed.
